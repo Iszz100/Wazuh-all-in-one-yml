@@ -18,6 +18,7 @@ FORCE_REINSTALL=0
 IGNORE_HARDWARE=0
 OPEN_API=0
 NO_FIREWALL=0
+USE_OVERWRITE=0
 
 usage() {
   cat <<USAGE
@@ -27,7 +28,10 @@ Installs Wazuh all-in-one on openSUSE Leap 16.0 using the official Wazuh
 installation assistant, with openSUSE compatibility preparation.
 
 Options:
-  --force-reinstall   Allow the official Wazuh installer overwrite mode (-o).
+  --force-reinstall   Replace an existing native or Docker-based Wazuh install.
+                      Native services are stopped. Detected Wazuh containers and
+                      their attached named volumes are removed. Official overwrite
+                      mode (-o) is used only when a native Wazuh install exists.
                       WARNING: existing Wazuh configuration/data can be removed.
   --ignore-hardware   Pass -i to the official installer to bypass its minimum
                       hardware check. Not recommended unless you understand the risk.
@@ -107,6 +111,24 @@ if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
   die "Run this installer as root: sudo ./${SCRIPT_NAME}"
 fi
 
+# Prevent two installer instances from running at the same time without
+# requiring any package that may not yet be installed.
+LOCKDIR="/run/wazuh-opensuse-all-in-one.lock"
+if ! mkdir "$LOCKDIR" 2>/dev/null; then
+  if [[ -r "$LOCKDIR/pid" ]]; then
+    old_pid="$(cat "$LOCKDIR/pid" 2>/dev/null || true)"
+    if [[ "$old_pid" =~ ^[0-9]+$ ]] && kill -0 "$old_pid" 2>/dev/null; then
+      die "Another Wazuh openSUSE installer instance is already running (PID ${old_pid})."
+    fi
+  fi
+
+  warn "Removing stale installer lock ${LOCKDIR}."
+  rm -rf "$LOCKDIR"
+  mkdir "$LOCKDIR" || die "Could not create installer lock ${LOCKDIR}"
+fi
+printf '%s\n' "$$" > "$LOCKDIR/pid"
+trap 'rm -rf "$LOCKDIR" 2>/dev/null || true' EXIT
+
 command -v zypper >/dev/null 2>&1 || die "zypper not found; this installer is for openSUSE"
 command -v rpm >/dev/null 2>&1 || die "rpm not found"
 
@@ -158,27 +180,109 @@ if ((CPU_COUNT < 4 || MEM_MB < 7800 || ROOT_FREE_MB < 50000)); then
   warn "System is below Wazuh's recommended quickstart sizing for small deployments (4 vCPU, 8 GiB RAM, 50 GB storage). Installation may still work for a lab."
 fi
 
-# ---------- Existing installation guard ----------
-existing=()
+# ---------- Existing installation / reinstall guard ----------
+native_existing=()
 for pkg in wazuh-indexer wazuh-manager wazuh-dashboard filebeat; do
   if rpm -q "$pkg" >/dev/null 2>&1; then
-    existing+=("$pkg")
+    native_existing+=("$pkg")
   fi
 done
 
 for path in /var/ossec /etc/wazuh-indexer /etc/wazuh-dashboard; do
   if [[ -e "$path" ]]; then
-    existing+=("$path")
+    native_existing+=("$path")
   fi
 done
 
-if ((${#existing[@]} > 0)); then
-  if ((FORCE_REINSTALL == 0)); then
-    printf 'Existing Wazuh-related installation detected:\n'
-    printf '  - %s\n' "${existing[@]}"
-    die "Refusing to overwrite existing data. Use --force-reinstall only if destroying/replacing the existing Wazuh installation is intended."
+docker_wazuh_ids=()
+docker_wazuh_volumes=()
+
+detect_wazuh_docker() {
+  docker_wazuh_ids=()
+  docker_wazuh_volumes=()
+
+  command -v docker >/dev/null 2>&1 || return 0
+  docker info >/dev/null 2>&1 || return 0
+
+  mapfile -t docker_wazuh_ids < <(
+    docker ps -a --format '{{.ID}}|{{.Names}}|{{.Image}}' 2>/dev/null |
+      awk -F'|' 'BEGIN{IGNORECASE=1} $2 ~ /wazuh/ || $3 ~ /wazuh/ {print $1}'
+  )
+
+  ((${#docker_wazuh_ids[@]} > 0)) || return 0
+
+  local cid
+  for cid in "${docker_wazuh_ids[@]}"; do
+    while IFS= read -r v; do
+      [[ -n "$v" ]] && docker_wazuh_volumes+=("$v")
+    done < <(
+      docker inspect --format '{{range .Mounts}}{{if eq .Type "volume"}}{{println .Name}}{{end}}{{end}}' \
+        "$cid" 2>/dev/null || true
+    )
+  done
+
+  if ((${#docker_wazuh_volumes[@]} > 0)); then
+    mapfile -t docker_wazuh_volumes < <(
+      printf '%s\n' "${docker_wazuh_volumes[@]}" | awk 'NF' | sort -u
+    )
   fi
-  warn "Existing Wazuh installation detected. Official overwrite mode (-o) will be used. Existing Wazuh data/configuration may be removed."
+}
+
+detect_wazuh_docker
+
+if ((${#native_existing[@]} > 0 || ${#docker_wazuh_ids[@]} > 0)); then
+  if ((FORCE_REINSTALL == 0)); then
+    if ((${#native_existing[@]} > 0)); then
+      printf 'Existing native Wazuh-related installation detected:\n'
+      printf '  - %s\n' "${native_existing[@]}"
+    fi
+
+    if ((${#docker_wazuh_ids[@]} > 0)); then
+      printf 'Existing Wazuh Docker containers detected:\n'
+      docker ps -a --filter "id=${docker_wazuh_ids[0]}" >/dev/null 2>&1 || true
+      local_output=""
+      for cid in "${docker_wazuh_ids[@]}"; do
+        docker inspect --format '  - {{.Name}} ({{.Config.Image}})' "$cid" 2>/dev/null || true
+      done
+    fi
+
+    die "Refusing to overwrite existing Wazuh data. Re-run with --force-reinstall only if replacing the existing installation is intended."
+  fi
+
+  warn "--force-reinstall requested. Existing Wazuh installation will be replaced."
+
+  if ((${#native_existing[@]} > 0)); then
+    USE_OVERWRITE=1
+  fi
+
+  # Stop native Wazuh services cleanly before port checks and overwrite mode.
+  for svc in wazuh-dashboard filebeat wazuh-manager wazuh-indexer; do
+    if systemctl list-unit-files "${svc}.service" >/dev/null 2>&1; then
+      systemctl stop "$svc" 2>/dev/null || true
+    fi
+  done
+
+  # Remove only containers that are positively identified by name/image as Wazuh.
+  # Attached named volumes are removed as part of the explicit destructive
+  # --force-reinstall path. Docker itself and unrelated containers/images remain.
+  if ((${#docker_wazuh_ids[@]} > 0)); then
+    log "Removing existing Wazuh Docker containers before native reinstall..."
+    docker rm -f "${docker_wazuh_ids[@]}"
+
+    if ((${#docker_wazuh_volumes[@]} > 0)); then
+      local_volume=""
+      for local_volume in "${docker_wazuh_volumes[@]}"; do
+        if docker volume inspect "$local_volume" >/dev/null 2>&1; then
+          docker volume rm "$local_volume" >/dev/null 2>&1 ||
+            warn "Could not remove Docker volume '${local_volume}' (it may still be referenced elsewhere)."
+        fi
+      done
+    fi
+
+    detect_wazuh_docker
+    ((${#docker_wazuh_ids[@]} == 0)) ||
+      die "One or more Wazuh Docker containers remain after --force-reinstall cleanup"
+  fi
 fi
 
 # ---------- Install openSUSE prerequisites ----------
@@ -187,7 +291,7 @@ zypper --non-interactive refresh
 
 base_packages=(
   bash curl ca-certificates tar gzip openssl hostname iproute2 systemd
-  systemd-sysvcompat python3 sudo rpm-build libcap2 libcap-progs procps
+  python3 sudo rpm-build libcap2 libcap-progs procps gpg2
   lsof coreutils grep gawk sed findutils util-linux
 )
 
@@ -220,10 +324,13 @@ command -v yum >/dev/null 2>&1 || die "yum compatibility command is still unavai
 mkdir -p /etc/yum.repos.d /etc/pki/rpm-gpg
 chmod 0755 /etc/yum.repos.d /etc/pki/rpm-gpg
 
-# systemd-sysvcompat should provide the helper rather than replacing a system file
-# with a dummy script.
-if [[ ! -x /usr/lib/systemd/systemd-sysv-install ]]; then
-  die "systemd-sysv-install helper is missing even after installing systemd-sysvcompat"
+# Leap 16 installations can legitimately omit the legacy SysV compatibility
+# helper. Wazuh central components install native systemd units, so the helper
+# is not a hard prerequisite. Do not create a fake file under /usr/lib/systemd.
+if [[ -x /usr/lib/systemd/systemd-sysv-install ]]; then
+  log "Legacy systemd SysV compatibility helper detected."
+else
+  warn "systemd-sysv-install is not present. Continuing because Wazuh central services use native systemd units."
 fi
 
 # ---------- Network preflight ----------
@@ -301,6 +408,74 @@ mkdir -p "$WORKDIR"
 chmod 0700 "$WORKDIR"
 prepare_libcap_compat
 
+# Wazuh's YUM path expects RHEL-family RPM names. openSUSE provides the
+# equivalent software under different package names:
+#   procps-ng -> procps
+#   gnupg2    -> gpg2
+# Build tiny metadata packages with the expected names, depending on the real
+# openSUSE packages. No binaries or libraries are replaced.
+prepare_name_compat() {
+  local compat_name="$1"
+  local real_name="$2"
+
+  if rpm -q "$compat_name" >/dev/null 2>&1; then
+    log "RPM dependency name '${compat_name}' is already satisfied."
+    return 0
+  fi
+
+  rpm -q "$real_name" >/dev/null 2>&1 || die "Required openSUSE package '${real_name}' is not installed"
+
+  local version rpmroot specfile compat_rpm docdir
+  version="$(rpm -q --qf '%{VERSION}' "$real_name" 2>/dev/null || echo '1')"
+  version="${version//[^0-9A-Za-z._+~-]/_}"
+  rpmroot="${WORKDIR}/rpmbuild-${compat_name}"
+  specfile="${rpmroot}/SPECS/${compat_name}-wazuh-compat.spec"
+  docdir="${compat_name}-wazuh-compat"
+
+  rm -rf "$rpmroot"
+  mkdir -p "$rpmroot"/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+
+  cat > "$specfile" <<SPEC
+Name:           ${compat_name}
+Version:        ${version}
+Release:        1.wazuhcompat
+Summary:        Wazuh RPM dependency compatibility metadata for openSUSE
+License:        MIT
+BuildArch:      noarch
+Requires:       ${real_name}
+Provides:       ${compat_name} = %{version}-%{release}
+
+%description
+Compatibility metadata package for the Wazuh installation assistant on
+openSUSE. Real functionality is supplied by the openSUSE package ${real_name}.
+
+%prep
+
+%build
+
+%install
+mkdir -p %{buildroot}/usr/share/doc/${docdir}
+printf '%s\n' 'Compatibility metadata only. Real package: ${real_name}.' \
+  > %{buildroot}/usr/share/doc/${docdir}/README
+
+%files
+/usr/share/doc/${docdir}/README
+SPEC
+
+  log "Building ${compat_name} compatibility RPM..."
+  rpmbuild -bb --define "_topdir ${rpmroot}" "$specfile"
+
+  compat_rpm="$(find "$rpmroot/RPMS" -type f -name "${compat_name}-*.noarch.rpm" -print -quit)"
+  [[ -n "$compat_rpm" && -f "$compat_rpm" ]] || die "${compat_name} compatibility RPM was not generated"
+
+  rpm -Uvh --replacepkgs "$compat_rpm"
+  rpm -q "$compat_name" >/dev/null 2>&1 || die "RPM dependency name '${compat_name}' is still not satisfied"
+  log "Installed compatibility RPM: $(rpm -q "$compat_name")"
+}
+
+prepare_name_compat procps-ng procps
+prepare_name_compat gnupg2 gpg2
+
 # ---------- Kernel setting required by the indexer ----------
 log "Configuring vm.max_map_count..."
 cat > /etc/sysctl.d/99-wazuh.conf <<'SYSCTL'
@@ -308,6 +483,83 @@ vm.max_map_count=262144
 SYSCTL
 chmod 0644 /etc/sysctl.d/99-wazuh.conf
 sysctl -w vm.max_map_count=262144 >/dev/null
+
+# ---------- Required-port preflight ----------
+# A previous Wazuh process can remain alive even after its RPM/files have been
+# removed. Only terminate listeners that can be positively identified as Wazuh,
+# OpenSearch/Wazuh Indexer, Wazuh Dashboard, Filebeat, or /var/ossec processes.
+cleanup_stale_wazuh_listeners() {
+  local ports=(9200 1514 1515 55000 "$DASHBOARD_PORT")
+  local pids=()
+  local port pid cmd exe user signature
+
+  for port in "${ports[@]}"; do
+    while read -r pid; do
+      [[ -n "$pid" ]] && pids+=("$pid")
+    done < <(
+      {
+        lsof -t -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null || true
+        lsof -t -nP -iUDP:"$port" 2>/dev/null || true
+      } | sort -u
+    )
+  done
+
+  if ((${#pids[@]} == 0)); then
+    log "Required Wazuh ports are free."
+    return 0
+  fi
+
+  mapfile -t pids < <(printf '%s\n' "${pids[@]}" | sort -un)
+
+  for pid in "${pids[@]}"; do
+    [[ -d "/proc/$pid" ]] || continue
+    cmd="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+    exe="$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)"
+    user="$(ps -o user= -p "$pid" 2>/dev/null | xargs || true)"
+    signature="${user} ${cmd} ${exe}"
+
+    if grep -Eqi '(wazuh|opensearch|filebeat|/var/ossec|wazuh-indexer|wazuh-dashboard)' <<<"$signature"; then
+      warn "Stopping stale Wazuh-related listener PID=${pid} USER=${user} CMD=${cmd:-unknown}"
+      kill -TERM "$pid" 2>/dev/null || true
+    else
+      warn "Required port is owned by a non-Wazuh process; refusing to terminate PID=${pid} USER=${user} CMD=${cmd:-unknown}"
+    fi
+  done
+
+  sleep 3
+
+  # Escalate only for processes that still exist and are still positively
+  # identifiable as Wazuh-related.
+  for pid in "${pids[@]}"; do
+    [[ -d "/proc/$pid" ]] || continue
+    cmd="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+    exe="$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)"
+    user="$(ps -o user= -p "$pid" 2>/dev/null | xargs || true)"
+    signature="${user} ${cmd} ${exe}"
+    if grep -Eqi '(wazuh|opensearch|filebeat|/var/ossec|wazuh-indexer|wazuh-dashboard)' <<<"$signature"; then
+      warn "Force-stopping stale Wazuh-related PID=${pid}"
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+  done
+
+  sleep 1
+
+  local conflict=0
+  for port in "${ports[@]}"; do
+    if lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | grep -q . ||
+       lsof -nP -iUDP:"$port" 2>/dev/null | grep -q .; then
+      warn "Port ${port} is still occupied:"
+      lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null || true
+      lsof -nP -iUDP:"$port" 2>/dev/null || true
+      conflict=1
+    fi
+  done
+
+  ((conflict == 0)) || die "One or more required Wazuh ports are occupied by non-Wazuh processes"
+  log "Required Wazuh ports are free after stale-process cleanup."
+}
+
+cleanup_stale_wazuh_listeners
 
 # ---------- Firewall (only if already active) ----------
 configure_firewall() {
@@ -354,7 +606,7 @@ log "Downloaded installer SHA-256: ${INSTALLER_SHA256}"
 
 # Fail early if Wazuh changes/removes an option this wrapper relies on.
 INSTALLER_HELP="$(bash "$INSTALLER" -h 2>&1 || true)"
-for required_opt in "-a" "-v" "-id"; do
+for required_opt in "-a" "-v" "-i"; do
   grep -Fq -- "$required_opt" <<<"$INSTALLER_HELP" || die "Downloaded Wazuh installer does not advertise required option ${required_opt}"
 done
 if ((DASHBOARD_PORT != 443)); then
@@ -363,7 +615,7 @@ fi
 if ((IGNORE_HARDWARE == 1)); then
   grep -Fq -- "-i" <<<"$INSTALLER_HELP" || die "Downloaded Wazuh installer does not advertise the hardware-check bypass option (-i)"
 fi
-if ((FORCE_REINSTALL == 1)); then
+if ((USE_OVERWRITE == 1)); then
   grep -Fq -- "-o" <<<"$INSTALLER_HELP" || die "Downloaded Wazuh installer does not advertise overwrite mode (-o)"
 fi
 
@@ -372,16 +624,31 @@ fi
 # verification enabled.
 
 # ---------- Run official all-in-one installation ----------
-installer_args=(-a -v -id)
+# openSUSE is outside the official central-component compatibility matrix.
+# Pass -i unconditionally so the official assistant does not stop on its own
+# distribution/hardware gate. This wrapper has already performed explicit
+# openSUSE and hardware preflight checks above.
+installer_args=(-a -v -i)
+
+# -id/--install-dependencies exists in some Wazuh installer revisions but not all.
+# The wrapper already installs the required openSUSE/DNF compatibility packages,
+# so use -id only when the downloaded official installer actually supports it.
+if grep -Fq -- "-id" <<<"$INSTALLER_HELP"; then
+  installer_args+=(-id)
+  log "Official installer supports -id; enabling dependency installation."
+else
+  log "Official installer does not expose -id; continuing because wrapper dependencies are already prepared."
+fi
 
 if ((DASHBOARD_PORT != 443)); then
   installer_args+=(-p "$DASHBOARD_PORT")
 fi
 if ((IGNORE_HARDWARE == 1)); then
-  installer_args+=(-i)
+  warn "--ignore-hardware requested: wrapper minimum-hardware guard was bypassed. The official assistant already receives -i for openSUSE compatibility."
 fi
-if ((FORCE_REINSTALL == 1)); then
+if ((USE_OVERWRITE == 1)); then
   installer_args+=(-o)
+  log "Native Wazuh installation detected; official overwrite mode (-o) enabled."
 fi
 
 log "Launching official Wazuh all-in-one installer..."
@@ -395,8 +662,55 @@ if [[ -f "$WORKDIR/wazuh-install-files.tar" ]]; then
   chmod 0600 "$WORKDIR/wazuh-install-files.tar"
 fi
 
-# ---------- Service validation ----------
+# ---------- Service boot persistence ----------
+# On Leap 16, systemctl may try the missing systemd-sysv-install helper for
+# Wazuh Indexer/Filebeat even though native unit files exist. First use normal
+# systemctl enable; if that still reports disabled, create the standard
+# multi-user.target wants symlink to the native unit file.
+ensure_service_enabled() {
+  local svc="$1"
+  local fragment=""
+  local link="/etc/systemd/system/multi-user.target.wants/${svc}.service"
+
+  systemctl daemon-reload
+
+  if systemctl is-enabled --quiet "$svc" 2>/dev/null; then
+    log "Service ${svc}: enabled at boot"
+    return 0
+  fi
+
+  if ! systemctl enable "$svc" >/dev/null 2>&1; then
+    warn "Normal 'systemctl enable ${svc}' did not succeed; applying native-unit symlink fallback."
+  fi
+
+  if ! systemctl is-enabled --quiet "$svc" 2>/dev/null; then
+    fragment="$(systemctl show "$svc" --property=FragmentPath --value 2>/dev/null || true)"
+    [[ -n "$fragment" && -f "$fragment" ]] ||
+      die "Cannot determine native systemd unit file for ${svc}"
+
+    mkdir -p /etc/systemd/system/multi-user.target.wants
+    ln -sfn "$fragment" "$link"
+    systemctl daemon-reload
+  fi
+
+  systemctl is-enabled --quiet "$svc" 2>/dev/null ||
+    die "Service ${svc} is still not enabled at boot"
+
+  log "Service ${svc}: enabled at boot"
+}
+
 services=(wazuh-indexer wazuh-manager filebeat wazuh-dashboard)
+log "Ensuring all Wazuh services start automatically after reboot..."
+for svc in "${services[@]}"; do
+  ensure_service_enabled "$svc"
+  systemctl start "$svc"
+done
+
+# Protect logs/credentials that may contain generated passwords.
+[[ -f /var/log/wazuh-install.log ]] && chmod 0600 /var/log/wazuh-install.log
+chmod 0600 "$LOGFILE"
+
+# ---------- Service validation ----------
 service_failure=0
 log "Validating Wazuh services..."
 for svc in "${services[@]}"; do
@@ -408,10 +722,17 @@ for svc in "${services[@]}"; do
     journalctl -u "$svc" --no-pager -n 80 || true
     service_failure=1
   fi
+
+  if systemctl is-enabled --quiet "$svc" 2>/dev/null; then
+    log "Service ${svc}: enabled"
+  else
+    warn "Service ${svc}: NOT ENABLED"
+    service_failure=1
+  fi
 done
 
 if ((service_failure != 0)); then
-  die "One or more Wazuh services are not active"
+  die "One or more Wazuh services are not active and enabled at boot"
 fi
 
 # ---------- Wait until the indexer answers HTTPS ----------
@@ -516,6 +837,7 @@ fi
 printf ' Installer : %s\n' "$INSTALLER"
 printf ' Log       : %s\n' "$LOGFILE"
 printf ' Wazuh log : /var/log/wazuh-install.log\n'
+printf ' Boot      : indexer/manager/filebeat/dashboard enabled\n'
 printf '============================================================\n'
 
 if ((NO_FIREWALL == 0)); then
